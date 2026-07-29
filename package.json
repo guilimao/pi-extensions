@@ -1,0 +1,13 @@
+{
+  "name": "pi-extensions",
+  "version": "1.0.0",
+  "description": "Personal pi extensions - browser automation and custom role override",
+  "keywords": ["pi-package"],
+  "pi": {
+    "extensions": ["./extensions"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  }
+}
