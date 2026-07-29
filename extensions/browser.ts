@@ -90,7 +90,7 @@ async function ensureBrowser(): Promise<void> {
     browserOpen = true;
   } catch (err: any) {
     if (isNotOpenError(err) || /error/i.test(err.message)) {
-      await pw("open about:blank", 15000);
+      await pw("open about:blank --browser=chromium", 15000);
       browserOpen = true;
     }
   }
