@@ -10,7 +10,7 @@ Personal pi coding agent extension collection.
 ## Install
 
 ```bash
-pi install git:github.com/Guilimao_Official/pi-extensions@v1.0.0
+pi install git:github.com/guilimao/pi-extensions@v1.0.0
 ```
 
 ## Prerequisites (browser extension)
