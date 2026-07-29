@@ -17,9 +17,12 @@
  *   browser_close      – Close the browser
  *
  * Lifecycle:
- *   - Browser opens lazily on the first navigate / snapshot / eval call.
- *   - On normal pi shutdown the browser is closed automatically.
- *   - If pi crashes, orphaned sessions can be cleaned up with:
+ *   - Each pi instance gets an independent browser session (pi-browser-<pid>).
+ *   - A reference file (~/.pi/browser-sessions/pi-browser-<pid>.ref) is
+ *     created when the browser opens.
+ *   - On normal shutdown, the browser is closed, the ref file is removed,
+ *     and orphaned sessions from crashed pi instances are garbage-collected.
+ *   - Orphaned sessions can also be cleaned up manually with:
  *         playwright-cli close-all
  *         playwright-cli kill-all   (for stuck/zombie processes)
  *
@@ -29,18 +32,31 @@
  */
 
 import { exec } from "node:child_process";
-import { readFile, access } from "node:fs/promises";
+import { readFile, access, mkdir, writeFile, readdir, unlink } from "node:fs/promises";
 import { constants } from "node:fs";
-import { resolve } from "node:path";
+import { resolve, join } from "node:path";
 import { promisify } from "node:util";
 import { Type } from "typebox";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 const execAsync = promisify(exec);
 
-const SESSION = "pi-browser";
+const PID = process.pid;
+const SESSION = `pi-browser-${PID}`;
 const PW = "playwright-cli";
 const HOME = process.env.HOME || process.env.USERPROFILE || ".";
+
+/** Per-instance reference file for lazy orphan cleanup. */
+const REF_DIR = join(HOME, ".pi", "browser-sessions");
+const REF_FILE = join(REF_DIR, `pi-browser-${PID}.ref`);
+
+/**
+ * Browser selection (optional env var).
+ * Defaults to "chromium" which maps to Playwright's bundled chrome-for-testing
+ * channel and does NOT require a system-installed Google Chrome.
+ * Set PI_BROWSER=chrome to use a system Chrome install instead.
+ */
+const BROWSER = process.env.PI_BROWSER || "chromium";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -67,6 +83,21 @@ async function pw(args: string, timeoutMs = 30000): Promise<string> {
     if (err && /error/i.test(err)) throw new Error(err);
     return err;
   } catch (err: any) {
+    // Detect missing prerequisites and give clear, actionable messages.
+    if (err.code === "ENOENT" || /command not found|not recognized/i.test(err.message)) {
+      throw new Error(
+        `playwright-cli is not installed. Install it with:\n` +
+        `  npm i -g @playwright/cli\n` +
+        `  playwright-cli install`
+      );
+    }
+    // Detect Chromium not found (daemon exits immediately).
+    if (/Chromium distribution|Executable doesn't exist|playwright install/i.test(err.message)) {
+      const browserHint = BROWSER === "chromium"
+        ? `Playwright's bundled Chromium is not installed. Install it with:\n  playwright-cli install`
+        : `Browser "${BROWSER}" is not available. Try:\n  playwright-cli install ${BROWSER}\nor set PI_BROWSER=chromium for the bundled Chromium.`;
+      throw new Error(browserHint);
+    }
     const msg = err.stderr?.trim() || err.stdout?.trim() || err.message;
     throw new Error(msg);
   }
@@ -80,6 +111,51 @@ function isNotOpenError(err: Error): boolean {
   return /not open/i.test(err.message);
 }
 
+/** Create a reference file so other pi instances can GC this session later. */
+async function createRefFile(): Promise<void> {
+  try {
+    await mkdir(REF_DIR, { recursive: true });
+    await writeFile(REF_FILE, JSON.stringify({ pid: PID, session: SESSION, createdAt: Date.now() }));
+  } catch {
+    // Non-critical; browser still works.
+  }
+}
+
+/**
+ * Garbage-collect orphaned browser sessions on graceful shutdown.
+ *
+ * 1. Close our own browser session and remove our ref file.
+ * 2. Scan remaining ref files; for each whose pi process is no longer
+ *    alive, close the corresponding playwright-cli session and delete
+ *    the stale ref file.
+ */
+async function cleanupOrphanedSessions(): Promise<void> {
+  // Close own session first.
+  try { await execAsync(`${PW} -s=${SESSION} close`, { timeout: 5000, windowsHide: true }); } catch { /* best-effort */ }
+  browserOpen = false;
+  try { await unlink(REF_FILE); } catch { /* file may not exist */ }
+
+  let files: string[];
+  try { files = await readdir(REF_DIR); } catch { return; }
+
+  for (const file of files) {
+    if (!file.startsWith("pi-browser-") || !file.endsWith(".ref")) continue;
+    const match = file.match(/^pi-browser-(\d+)\.ref$/);
+    if (!match) continue;
+    const refPid = parseInt(match[1], 10);
+
+    // Check whether the process that created this ref is still alive.
+    let alive = false;
+    try { process.kill(refPid, 0); alive = true; } catch { /* ESRCH - no such process */ }
+
+    if (!alive) {
+      const refPath = join(REF_DIR, file);
+      try { await execAsync(`${PW} -s=pi-browser-${refPid} close`, { timeout: 5000, windowsHide: true }); } catch { /* best-effort */ }
+      try { await unlink(refPath); } catch { /* best-effort */ }
+    }
+  }
+}
+
 let browserOpen = false;
 
 /** Make sure a browser session exists, opening one if needed. */
@@ -90,8 +166,15 @@ async function ensureBrowser(): Promise<void> {
     browserOpen = true;
   } catch (err: any) {
     if (isNotOpenError(err) || /error/i.test(err.message)) {
-      await pw("open about:blank --browser=chromium", 15000);
+      // --browser=chromium uses Playwright's bundled chrome-for-testing
+      // channel, which does not require a system-installed Google Chrome.
+      // Falls back to / re-throws with a clear message when prerequisites
+      // are missing (playwright-cli not installed / Chromium not found).
+      await pw(`open about:blank --browser=${BROWSER}`, 15000);
       browserOpen = true;
+      await createRefFile();
+    } else {
+      throw err;
     }
   }
 }
@@ -492,18 +575,13 @@ export default function (pi: ExtensionAPI) {
 
   // -- Lifecycle cleanup -------------------------------------------------
   //
-  // Normal shutdown: close the browser so no orphaned Chromium processes
-  // linger.  If pi is killed (SIGKILL / taskkill / crash), the browser
-  // process stays alive.  The user can recover with:
-  //     playwright-cli close-all
-  //     playwright-cli kill-all
+  // Graceful shutdown: close our own browser session, remove our ref file,
+  // then scan for and close orphaned sessions from crashed pi instances.
+  // If pi is killed (SIGKILL / taskkill / crash), our ref file remains and
+  // will be cleaned up by the next pi instance that exits gracefully.
+  // Manual fallback: playwright-cli close-all  /  playwright-cli kill-all
   //
   pi.on("session_shutdown", async () => {
-    try {
-      await pw("close", 5000);
-      browserOpen = false;
-    } catch {
-      // best-effort
-    }
+    await cleanupOrphanedSessions();
   });
 }
